@@ -1,0 +1,16 @@
+[package]
+name = "objk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+slatedb = "0.17.0"
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
