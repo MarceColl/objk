@@ -1,13 +1,15 @@
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /src
 COPY . .
 RUN cargo build --release
 
+# TLS to object stores needs CA roots, which scratch lacks.
 FROM scratch AS base
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 EXPOSE 3000
 VOLUME /data
-ENTRYPOINT ["/objk", "/data"]
+ENTRYPOINT ["/objk"]
 
 # CI: package prebuilt binaries from dist/, no compile per platform.
 FROM base AS dist

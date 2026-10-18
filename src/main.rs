@@ -3,10 +3,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use slatedb::bytes::Bytes;
 use slatedb::config::{DurabilityLevel, ScanOptions};
-use slatedb::object_store::local::LocalFileSystem;
 use slatedb::{Db, Error, IterationOrder};
+use std::future::ready;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -36,6 +38,12 @@ fn group_key(group: &str, topic: &str, p: u32) -> Vec<u8> {
     [b"g/", group.as_bytes(), b"/", &partition_key(b"", topic, p)].concat()
 }
 
+// Metrics. Lag isn't exported: Grafana derives it as
+//   objk_head_offset - on(topic, partition) group_right objk_committed_offset
+fn labels(topic: &str, p: u32) -> [(&'static str, String); 2] {
+    [("topic", topic.to_string()), ("partition", p.to_string())]
+}
+
 #[derive(Debug)]
 enum QErr {
     Db(Error),
@@ -62,12 +70,17 @@ impl Store {
     /// Topics and partitions are implicit: they exist once written to.
     async fn produce(&self, topic: &str, p: u32, bytes: &[u8]) -> Result<u64, QErr> {
         name(topic)?;
+        let l = labels(topic, p);
         let (off, handle) = {
             let _g = self.write.lock().await;
             let off = self.last(topic, p).await?.map_or(0, |o| o + 1);
-            (off, self.db.put(msg_key(topic, p, off), bytes).await?)
+            let handle = self.db.put(msg_key(topic, p, off), bytes).await?;
+            gauge!("objk_head_offset", &l).set((off + 1) as f64);
+            (off, handle)
         };
         handle.await_durable().await?;
+        counter!("objk_produced_messages_total", &l).increment(1);
+        counter!("objk_produced_bytes_total", &l).increment(bytes.len() as u64);
         Ok(off)
     }
 
@@ -81,6 +94,7 @@ impl Store {
             let Some(kv) = it.next().await? else { break };
             out.push((msg_off(&kv.key), kv.value));
         }
+        counter!("objk_fetched_messages_total", &labels(topic, p)).increment(out.len() as u64);
         Ok(out)
     }
 
@@ -89,6 +103,8 @@ impl Store {
         let handle = {
             let _g = self.write.lock().await;
             let off = off.max(self.committed(group, topic, p).await?);
+            let l = [("group", group.to_string()), ("topic", topic.to_string()), ("partition", p.to_string())];
+            gauge!("objk_committed_offset", &l).set(off as f64);
             self.db.put(group_key(group, topic, p), off.to_be_bytes()).await?
         };
         Ok(handle.await_durable().await?)
@@ -150,14 +166,19 @@ fn router(s: Arc<Store>) -> Router {
         .with_state(s)
 }
 
-/// `objk [dir]`: data lives under `dir` (default `data`), served on :3000.
+/// Served on :3000. Config is env only:
+///   OBJK_STORE  object store root URL, no path (default `file:///`), e.g. `s3://bucket`
+///   OBJK_PATH   DB location inside the store (default `data`)
+///   AWS_*       store options, passed through by slateDB (AWS_ENDPOINT, AWS_ALLOW_HTTP, ...)
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::args().nth(1).unwrap_or("data".into());
-    std::fs::create_dir_all(&dir)?;
-    let db = Db::open("objk", Arc::new(LocalFileSystem::new_with_prefix(dir)?)).await?;
+    let env = |k, d: &str| std::env::var(k).unwrap_or(d.into());
+    let store = Db::resolve_object_store(&env("OBJK_STORE", "file:///"))?;
+    let db = Db::open(env("OBJK_PATH", "data"), store).await?;
+    let metrics = PrometheusBuilder::new().install_recorder()?;
+    let app = router(Arc::new(Store::new(db))).route("/metrics", get(move || ready(metrics.render())));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    axum::serve(listener, router(Arc::new(Store::new(db)))).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
