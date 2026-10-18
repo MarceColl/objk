@@ -161,7 +161,13 @@ impl Store {
     /// Only durable messages: anything else could vanish on crash and its offset be reused.
     async fn fetch(&self, topic: &str, p: u32, from: u64, max: usize) -> Result<Vec<(u64, Bytes)>, QErr> {
         name(topic)?;
-        let opts = ScanOptions { durability_filter: DurabilityLevel::Remote, ..Default::default() };
+        let opts = ScanOptions {
+            durability_filter: DurabilityLevel::Remote,
+            read_ahead_bytes: 256 * 1024,
+            cache_blocks: true,
+            max_fetch_tasks: 4,
+            ..Default::default()
+        };
         let mut it = self.db.scan_with_options(msg_key(topic, p, from)..=msg_key(topic, p, u64::MAX), &opts).await?;
         let mut out = Vec::new();
         while out.len() < max {
