@@ -40,17 +40,34 @@ Only one objk may run per store + path: slateDB fences the older writer.
 ## API
 
 ```
-POST /t/{topic}/{p}              body: bytes  -> offset
-GET  /t/{topic}/{p}/{from}                    -> (u64 off | u32 len | bytes)*, max 1000
-PUT  /g/{group}/{topic}/{p}/{off}             -> commit next offset to read (monotonic)
-GET  /g/{group}/{topic}/{p}                   -> committed offset (0 if none)
-GET  /metrics                                 -> Prometheus
+POST /t/{topic}/{p}              body: message(s)  -> first offset
+GET  /t/{topic}/{p}                                -> head (next offset to be written)
+GET  /t/{topic}/{p}/{from}                         -> up to 1000 messages from `from`
+PUT  /g/{group}/{topic}/{p}/{off}                  -> commit next offset to read (monotonic)
+GET  /g/{group}/{topic}/{p}                        -> committed offset (0 if none)
+GET  /metrics                                      -> Prometheus
 ```
 
-Topics and partitions exist once written to. Example:
+Topics and partitions exist once written to. A batch is written atomically at contiguous offsets.
+
+Formats are picked by header:
+
+| Header                    | Value                      | Body                                      |
+|---------------------------|----------------------------|-------------------------------------------|
+| produce `Content-Type`    | `application/json`         | `["msg", ...]` (UTF-8 strings)            |
+|                           | `application/x-objk-batch` | `(u32 len \| bytes)*`, big-endian         |
+|                           | anything else              | the whole body is one message             |
+| fetch `Accept`            | `application/json`         | `[{"offset": 0, "value": "msg"}, ...]`    |
+|                           | anything else              | `(u64 off \| u32 len \| bytes)*`, big-endian |
+
+JSON fetch fails with 400 on non-UTF-8 messages; use the binary format for those.
 
 ```sh
-curl -XPOST --data-binary hello localhost:3000/t/orders/0   # 0
-curl -s localhost:3000/t/orders/0/0 | xxd
-curl -XPUT localhost:3000/g/billing/orders/0/1
+curl -XPOST --data-binary hello localhost:3000/t/orders/0                                      # 0
+curl -XPOST -H 'content-type: application/json' -d '["a","b"]' localhost:3000/t/orders/0      # 1
+curl localhost:3000/t/orders/0                                                                 # 3
+curl -H 'accept: application/json' localhost:3000/t/orders/0/0
+curl -XPUT localhost:3000/g/billing/orders/0/3
 ```
+
+Logs go to stdout; filter with `RUST_LOG` (default `info`). SIGTERM/SIGINT drain in-flight requests and close the DB.

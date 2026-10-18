@@ -1667,8 +1667,12 @@ dependencies = [
  "axum",
  "metrics",
  "metrics-exporter-prometheus",
+ "serde",
+ "serde_json",
  "slatedb",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
