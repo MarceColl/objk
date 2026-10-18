@@ -21,14 +21,15 @@ use tracing_subscriber::EnvFilter;
 // (no separator needed) so byte order == numeric order.
 //   m/{topic}/{p}{off}        -> payload
 //   g/{group}/{topic}/{p}     -> u64 committed
+//   c/{group}/{topic}/{p}     -> u64 claim expiry (unix ms) | member
 
 /// Names are embedded in keys, so '/' would make `foo` a prefix of `foo/bar`.
 fn name(s: &str) -> Result<(), QErr> {
-    ensure(!s.is_empty() && !s.contains('/'), "bad name")
+    ensure(!s.is_empty() && !s.contains('/'), QErr::Bad("bad name"))
 }
 
-fn ensure(ok: bool, why: &'static str) -> Result<(), QErr> {
-    ok.then_some(()).ok_or(QErr::Bad(why))
+fn ensure(ok: bool, e: QErr) -> Result<(), QErr> {
+    ok.then_some(()).ok_or(e)
 }
 
 fn partition_key(kind: &[u8], topic: &str, p: u32) -> Vec<u8> {
@@ -43,8 +44,15 @@ fn msg_off(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
 }
 
-fn group_key(group: &str, topic: &str, p: u32) -> Vec<u8> {
-    [b"g/", group.as_bytes(), b"/", &partition_key(b"", topic, p)].concat()
+fn group_key(kind: &[u8], group: &str, topic: &str, p: u32) -> Vec<u8> {
+    [kind, group.as_bytes(), b"/", &partition_key(b"", topic, p)].concat()
+}
+
+/// How long a claim lives without being renewed.
+const CLAIM_TTL_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 // Metrics. Lag isn't exported: Grafana derives it as
@@ -58,6 +66,8 @@ enum QErr {
     Db(Error),
     /// Client error, returned as 400.
     Bad(&'static str),
+    /// Partition claimed by another member, returned as 409.
+    Taken,
 }
 
 impl From<Error> for QErr {
@@ -81,7 +91,7 @@ impl Store {
     /// Topics and partitions are implicit: they exist once written to.
     async fn produce(&self, topic: &str, p: u32, msgs: &[Bytes]) -> Result<u64, QErr> {
         name(topic)?;
-        ensure(!msgs.is_empty(), "empty batch")?;
+        ensure(!msgs.is_empty(), QErr::Bad("empty batch"))?;
         let l = labels(topic, p);
         let (first, handle) = {
             let _g = self.write.lock().await;
@@ -114,14 +124,16 @@ impl Store {
         Ok(out)
     }
 
-    /// `off` is the next offset to read. Monotonic: a stale consumer can't move it back.
-    async fn commit(&self, group: &str, topic: &str, p: u32, off: u64) -> Result<(), QErr> {
+    /// `off` is the next offset to read. Only the claim holder may commit, and it's monotonic,
+    /// so a stale consumer can't move it back.
+    async fn commit(&self, group: &str, topic: &str, p: u32, member: &str, off: u64, now: u64) -> Result<(), QErr> {
         let handle = {
             let _g = self.write.lock().await;
+            ensure(self.holder(group, topic, p, now).await?.as_deref() == Some(member), QErr::Taken)?;
             let off = off.max(self.committed(group, topic, p).await?);
             let l = [("group", group.to_string()), ("topic", topic.to_string()), ("partition", p.to_string())];
             gauge!("objk_committed_offset", &l).set(off as f64);
-            self.db.put(group_key(group, topic, p), off.to_be_bytes()).await?
+            self.db.put(group_key(b"g/", group, topic, p), off.to_be_bytes()).await?
         };
         Ok(handle.await_durable().await?)
     }
@@ -129,8 +141,39 @@ impl Store {
     async fn committed(&self, group: &str, topic: &str, p: u32) -> Result<u64, QErr> {
         name(group)?;
         name(topic)?;
-        let v = self.db.get(group_key(group, topic, p)).await?;
+        let v = self.db.get(group_key(b"g/", group, topic, p)).await?;
         Ok(v.map_or(0, |v| u64::from_be_bytes(v[..].try_into().unwrap())))
+    }
+
+    /// Takes the claim if free, expired or already ours, and (re)sets it to expire in CLAIM_TTL_MS.
+    /// Holders renew by calling it again.
+    async fn claim(&self, group: &str, topic: &str, p: u32, member: &str, now: u64) -> Result<(), QErr> {
+        ensure(!member.is_empty(), QErr::Bad("missing member"))?;
+        let handle = {
+            let _g = self.write.lock().await;
+            ensure(self.holder(group, topic, p, now).await?.is_none_or(|h| h == member), QErr::Taken)?;
+            let v = [&(now + CLAIM_TTL_MS).to_be_bytes()[..], member.as_bytes()].concat();
+            self.db.put(group_key(b"c/", group, topic, p), v).await?
+        };
+        Ok(handle.await_durable().await?)
+    }
+
+    /// Drops the claim if we hold it; otherwise a no-op.
+    async fn release(&self, group: &str, topic: &str, p: u32, member: &str, now: u64) -> Result<(), QErr> {
+        let _g = self.write.lock().await;
+        if self.holder(group, topic, p, now).await?.as_deref() == Some(member) {
+            self.db.delete(group_key(b"c/", group, topic, p)).await?.await_durable().await?;
+        }
+        Ok(())
+    }
+
+    /// Member holding an unexpired claim, if any.
+    async fn holder(&self, group: &str, topic: &str, p: u32, now: u64) -> Result<Option<String>, QErr> {
+        name(group)?;
+        name(topic)?;
+        let v = self.db.get(group_key(b"c/", group, topic, p)).await?;
+        let live = v.filter(|v| u64::from_be_bytes(v[..8].try_into().unwrap()) > now);
+        Ok(live.map(|v| String::from_utf8_lossy(&v[8..]).into_owned()))
     }
 
     /// Next offset to be written. Derived from the last message key, so no counter to keep in sync.
@@ -143,11 +186,10 @@ impl Store {
 }
 
 // HTTP. Offsets are plain-text numbers. Formats are picked by header:
-//   produce Content-Type: application/json         ["msg", ...] (UTF-8 strings)
-//                         application/x-objk-batch (u32 len | bytes)*
-//                         anything else            the whole body is one message
-//   fetch   Accept:       application/json         [{"offset": n, "value": "msg"}, ...]
-//                         anything else            (u64 off | u32 len | bytes)*
+//   produce Content-Type: application/json  ["msg", ...] (UTF-8 strings)
+//                         anything else     (u32 len | bytes)*
+//   fetch   Accept:       application/json  [{"offset": n, "value": "msg"}, ...]
+//                         anything else     (u64 off | u32 len | bytes)*
 
 const FETCH_MAX: usize = 1000;
 
@@ -157,6 +199,7 @@ impl IntoResponse for QErr {
     fn into_response(self) -> Response {
         match self {
             QErr::Bad(why) => (StatusCode::BAD_REQUEST, why).into_response(),
+            QErr::Taken => (StatusCode::CONFLICT, "claimed by another member").into_response(),
             QErr::Db(e) => {
                 error!(%e, "db");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -165,7 +208,7 @@ impl IntoResponse for QErr {
     }
 }
 
-fn header<'a>(h: &'a HeaderMap, k: header::HeaderName) -> &'a str {
+fn header<'a>(h: &'a HeaderMap, k: impl header::AsHeaderName) -> &'a str {
     h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
@@ -173,7 +216,7 @@ fn unframe(mut b: Bytes) -> Result<Vec<Bytes>, QErr> {
     let mut out = Vec::new();
     while b.has_remaining() {
         let n = b.try_get_u32().map_err(|_| QErr::Bad("bad batch framing"))? as usize;
-        ensure(b.len() >= n, "bad batch framing")?;
+        ensure(b.len() >= n, QErr::Bad("bad batch framing"))?;
         out.push(b.split_to(n));
     }
     Ok(out)
@@ -184,10 +227,8 @@ async fn produce(State(s): S, Path((t, p)): Path<(String, u32)>, h: HeaderMap, b
     let msgs = if ct.starts_with("application/json") {
         let v: Vec<String> = serde_json::from_slice(&body).map_err(|_| QErr::Bad("expected JSON array of strings"))?;
         v.into_iter().map(Bytes::from).collect()
-    } else if ct.starts_with("application/x-objk-batch") {
-        unframe(body)?
     } else {
-        vec![body]
+        unframe(body)?
     };
     Ok(s.produce(&t, p, &msgs).await?.to_string())
 }
@@ -215,8 +256,19 @@ async fn head(State(s): S, Path((t, p)): Path<(String, u32)>) -> Result<String, 
     Ok(s.head(&t, p).await?.to_string())
 }
 
-async fn commit(State(s): S, Path((g, t, p, off)): Path<(String, String, u32, u64)>) -> Result<(), QErr> {
-    s.commit(&g, &t, p, off).await
+// Claims and commits identify the consumer by this header.
+const MEMBER: &str = "x-objk-member";
+
+async fn commit(State(s): S, Path((g, t, p, off)): Path<(String, String, u32, u64)>, h: HeaderMap) -> Result<(), QErr> {
+    s.commit(&g, &t, p, header(&h, MEMBER), off, now_ms()).await
+}
+
+async fn claim(State(s): S, Path((g, t, p)): Path<(String, String, u32)>, h: HeaderMap) -> Result<(), QErr> {
+    s.claim(&g, &t, p, header(&h, MEMBER), now_ms()).await
+}
+
+async fn release(State(s): S, Path((g, t, p)): Path<(String, String, u32)>, h: HeaderMap) -> Result<(), QErr> {
+    s.release(&g, &t, p, header(&h, MEMBER), now_ms()).await
 }
 
 async fn committed(State(s): S, Path((g, t, p)): Path<(String, String, u32)>) -> Result<String, QErr> {
@@ -228,6 +280,7 @@ fn router(s: Arc<Store>) -> Router {
         .route("/t/{t}/{p}", post(produce).get(head))
         .route("/t/{t}/{p}/{from}", get(fetch))
         .route("/g/{g}/{t}/{p}", get(committed))
+        .route("/g/{g}/{t}/{p}/claim", post(claim).delete(release))
         .route("/g/{g}/{t}/{p}/{off}", axum::routing::put(commit))
         .with_state(s)
 }
@@ -311,11 +364,37 @@ mod tests {
     #[tokio::test]
     async fn commit_monotonic() {
         let s = store().await;
+        s.claim("g", "a", 0, "m", 0).await.unwrap();
         assert_eq!(s.committed("g", "a", 0).await.unwrap(), 0);
-        s.commit("g", "a", 0, 5).await.unwrap();
-        s.commit("g", "a", 0, 3).await.unwrap();
+        s.commit("g", "a", 0, "m", 5, 0).await.unwrap();
+        s.commit("g", "a", 0, "m", 3, 0).await.unwrap();
         assert_eq!(s.committed("g", "a", 0).await.unwrap(), 5);
         assert_eq!(s.committed("h", "a", 0).await.unwrap(), 0);
-        assert!(matches!(s.commit("g/x", "a", 0, 1).await, Err(QErr::Bad(_))));
+        assert!(matches!(s.commit("g/x", "a", 0, "m", 1, 0).await, Err(QErr::Bad(_))));
+    }
+
+    #[tokio::test]
+    async fn claims() {
+        let s = store().await;
+        let ttl = CLAIM_TTL_MS;
+        assert!(matches!(s.claim("g", "a", 0, "", 0).await, Err(QErr::Bad(_))));
+        assert!(matches!(s.commit("g", "a", 0, "m", 1, 0).await, Err(QErr::Taken)));
+
+        s.claim("g", "a", 0, "m", 0).await.unwrap();
+        s.claim("g", "a", 0, "m", 0).await.unwrap();
+        s.claim("g", "a", 1, "n", 0).await.unwrap();
+        s.claim("h", "a", 0, "n", 0).await.unwrap();
+        assert!(matches!(s.claim("g", "a", 0, "n", ttl - 1).await, Err(QErr::Taken)));
+        assert!(matches!(s.commit("g", "a", 0, "n", 1, 0).await, Err(QErr::Taken)));
+
+        s.claim("g", "a", 0, "m", ttl - 1).await.unwrap();
+        assert!(matches!(s.claim("g", "a", 0, "n", ttl).await, Err(QErr::Taken)));
+        s.claim("g", "a", 0, "n", 2 * ttl).await.unwrap();
+        assert!(matches!(s.commit("g", "a", 0, "m", 1, 2 * ttl).await, Err(QErr::Taken)));
+
+        s.release("g", "a", 0, "m", 2 * ttl).await.unwrap();
+        assert!(matches!(s.claim("g", "a", 0, "m", 2 * ttl).await, Err(QErr::Taken)));
+        s.release("g", "a", 0, "n", 2 * ttl).await.unwrap();
+        s.claim("g", "a", 0, "m", 2 * ttl).await.unwrap();
     }
 }
