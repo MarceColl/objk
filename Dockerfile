@@ -17,7 +17,7 @@ ENTRYPOINT ["/objk"]
 # CI: package prebuilt binaries from dist/, no compile per platform.
 FROM base AS dist
 ARG TARGETARCH
-COPY dist/objk-linux-${TARGETARCH} /objk
+COPY --chmod=755 dist/objk-linux-${TARGETARCH} /objk
 
 # Default: self-contained build.
 FROM base
