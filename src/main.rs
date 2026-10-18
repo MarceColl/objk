@@ -1,6 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use metrics::{counter, gauge};
@@ -48,6 +48,18 @@ fn group_key(kind: &[u8], group: &str, topic: &str, p: u32) -> Vec<u8> {
     [kind, group.as_bytes(), b"/", &partition_key(b"", topic, p)].concat()
 }
 
+/// Splits `{name}/rest` (keys only ever hold valid names).
+fn split_name(k: &[u8]) -> (&str, &[u8]) {
+    let i = k.iter().position(|&b| b == b'/').unwrap();
+    (std::str::from_utf8(&k[..i]).unwrap(), &k[i + 1..])
+}
+
+/// Parses `{topic}/{p}...` back out of a key with its kind prefix stripped.
+fn split_partition(k: &[u8]) -> (&str, u32, &[u8]) {
+    let (topic, rest) = split_name(k);
+    (topic, u32::from_be_bytes(rest[..4].try_into().unwrap()), &rest[4..])
+}
+
 /// How long a claim lives without being renewed.
 const CLAIM_TTL_MS: u64 = 30_000;
 
@@ -59,6 +71,22 @@ fn now_ms() -> u64 {
 //   objk_head_offset - on(topic, partition) group_right objk_committed_offset
 fn labels(topic: &str, p: u32) -> [(&'static str, String); 2] {
     [("topic", topic.to_string()), ("partition", p.to_string())]
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct Partition {
+    topic: String,
+    partition: u32,
+    head: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct Group {
+    group: String,
+    topic: String,
+    partition: u32,
+    committed: u64,
+    holder: Option<String>,
 }
 
 #[derive(Debug)]
@@ -176,6 +204,38 @@ impl Store {
         Ok(live.map(|v| String::from_utf8_lossy(&v[8..]).into_owned()))
     }
 
+    /// Every partition with its head, by skip-scan over the message keys: one seek per
+    /// partition, nothing extra to keep in sync. `m0` bounds the scan: '0' sorts right after '/'.
+    async fn partitions(&self) -> Result<Vec<Partition>, QErr> {
+        let mut out = Vec::new();
+        let mut from = b"m/".to_vec();
+        loop {
+            let Some(kv) = self.db.scan(from..b"m0".to_vec()).await?.next().await? else { break };
+            let (topic, p, _) = split_partition(&kv.key[2..]);
+            out.push(Partition { topic: topic.into(), partition: p, head: self.head(topic, p).await? });
+            from = match p.checked_add(1) {
+                Some(next) => partition_key(b"m/", topic, next),
+                None => [b"m/", topic.as_bytes(), b"0"].concat(),
+            };
+        }
+        Ok(out)
+    }
+
+    /// Every committed group offset, with the live claim holder. Groups that only ever
+    /// claimed have nothing committed and aren't listed.
+    async fn groups(&self, now: u64) -> Result<Vec<Group>, QErr> {
+        let mut it = self.db.scan(b"g/".to_vec()..b"g0".to_vec()).await?;
+        let mut out = Vec::new();
+        while let Some(kv) = it.next().await? {
+            let (group, rest) = split_name(&kv.key[2..]);
+            let (topic, p, _) = split_partition(rest);
+            let committed = u64::from_be_bytes(kv.value[..].try_into().unwrap());
+            let holder = self.holder(group, topic, p, now).await?;
+            out.push(Group { group: group.into(), topic: topic.into(), partition: p, committed, holder });
+        }
+        Ok(out)
+    }
+
     /// Next offset to be written. Derived from the last message key, so no counter to keep in sync.
     async fn head(&self, topic: &str, p: u32) -> Result<u64, QErr> {
         name(topic)?;
@@ -275,8 +335,20 @@ async fn committed(State(s): S, Path((g, t, p)): Path<(String, String, u32)>) ->
     Ok(s.committed(&g, &t, p).await?.to_string())
 }
 
+async fn partitions(State(s): S) -> Result<Json<Vec<Partition>>, QErr> {
+    Ok(Json(s.partitions().await?))
+}
+
+async fn groups(State(s): S) -> Result<Json<Vec<Group>>, QErr> {
+    Ok(Json(s.groups(now_ms()).await?))
+}
+
 fn router(s: Arc<Store>) -> Router {
     Router::new()
+        // Read-only browser over the JSON listings and the binary fetch.
+        .route("/", get(|| ready(Html(include_str!("ui.html")))))
+        .route("/t", get(partitions))
+        .route("/g", get(groups))
         .route("/t/{t}/{p}", post(produce).get(head))
         .route("/t/{t}/{p}/{from}", get(fetch))
         .route("/g/{g}/{t}/{p}", get(committed))
@@ -350,6 +422,34 @@ mod tests {
         assert_eq!(got, vec![(1, Bytes::from("y")), (2, Bytes::from("z"))]);
         assert_eq!(s.fetch("a", 0, 0, 1).await.unwrap().len(), 1);
         assert!(s.fetch("a", 0, 3, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listings() {
+        let s = store().await;
+        assert!(s.partitions().await.unwrap().is_empty());
+        assert!(s.groups(0).await.unwrap().is_empty());
+
+        // "a" is a byte prefix of "ab", and partition u32::MAX is the skip-scan's edge.
+        for (t, p, n) in [("ab", 0, 1), ("a", 1, 2), ("a", 0, 3), ("a", u32::MAX, 1), ("b", 7, 1)] {
+            s.produce(t, p, &msgs(&["x"; 3][..n])).await.unwrap();
+        }
+        let got: Vec<_> = s.partitions().await.unwrap().into_iter().map(|p| (p.topic, p.partition, p.head)).collect();
+        let want = [("a", 0, 3), ("a", 1, 2), ("a", u32::MAX, 1), ("ab", 0, 1), ("b", 7, 1)];
+        assert_eq!(got, want.map(|(t, p, h)| (t.to_string(), p, h)));
+
+        s.claim("g", "a", 1, "m", 0).await.unwrap();
+        s.commit("g", "a", 1, "m", 2, 0).await.unwrap();
+        s.claim("only-claims", "a", 0, "m", 0).await.unwrap();
+        let g = |holder: Option<&str>| Group {
+            group: "g".into(),
+            topic: "a".into(),
+            partition: 1,
+            committed: 2,
+            holder: holder.map(Into::into),
+        };
+        assert_eq!(s.groups(0).await.unwrap(), vec![g(Some("m"))]);
+        assert_eq!(s.groups(CLAIM_TTL_MS).await.unwrap(), vec![g(None)]);
     }
 
     #[test]

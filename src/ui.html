@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>objk</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1d1d1b; --muted: #74726c; --line: #e4e2dc; --hover: #f1efe9;
+    --accent: #2f5fd0; --warn: #a3520f; --chip: #eceae4;
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --fg: #e8e6e1; --muted: #9a978f; --line: #2c2b28; --hover: #22211f;
+      --accent: #7ea2ff; --warn: #e7a35c; --chip: #2a2926;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .02em; }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); margin: 28px 0 8px; }
+  .muted { color: var(--muted); }
+  .mono, td.num, .val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  button, input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 4px 10px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:disabled { opacity: .45; cursor: default; }
+  input { width: 9em; }
+  .grow { flex: 1; }
+  .wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  tbody tr.link { cursor: pointer; }
+  tbody tr.link:hover, tbody tr.sel { background: var(--hover); }
+  tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .lag { color: var(--warn); }
+  .empty { padding: 14px 12px; color: var(--muted); }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+  .val { white-space: pre-wrap; word-break: break-all; }
+  td.val { white-space: pre-wrap; width: 100%; }
+  .chip { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--chip);
+          color: var(--muted); margin-right: 6px; vertical-align: 1px; font-family: inherit; }
+  .err { color: var(--warn); margin: 8px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>objk</h1>
+    <span class="muted grow" id="updated"></span>
+    <button id="refresh">Refresh</button>
+  </header>
+
+  <h2>Partitions</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>Topic</th><th class="num">Partition</th><th class="num">Head</th></tr></thead>
+    <tbody id="partitions"></tbody>
+  </table></div>
+
+  <h2>Consumer groups</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>Group</th><th>Topic</th><th class="num">Partition</th><th class="num">Committed</th>
+      <th class="num">Lag</th><th>Claimed by</th></tr></thead>
+    <tbody id="groups"></tbody>
+  </table></div>
+
+  <section id="viewer" hidden>
+    <h2 id="vtitle"></h2>
+    <div class="bar">
+      <button id="older">&lsaquo; Older</button>
+      <button id="newer">Newer &rsaquo;</button>
+      <button id="latest">Latest</button>
+      <span class="muted">from</span>
+      <input id="from" type="number" min="0" step="1">
+      <span class="muted" id="range"></span>
+    </div>
+    <div class="err" id="verr" hidden></div>
+    <div class="wrap"><table>
+      <thead><tr><th class="num">Offset</th><th class="num">Bytes</th><th>Value</th></tr></thead>
+      <tbody id="messages"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+// Read-only: GET /t, GET /g, and the binary fetch GET /t/{topic}/{p}/{from},
+// which frames each message as (u64 offset | u32 len | bytes), big-endian.
+const PAGE = 100;
+const $ = id => document.getElementById(id);
+let parts = [];
+let view = null; // {topic, partition, from}
+
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) k === "class" ? e.className = v : e.setAttribute(k, v);
+  for (const k of kids) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+}
+const td = (v, cls = "") => el("td", cls ? { class: cls } : {}, v);
+const empty = (n, msg) => el("tr", {}, el("td", { colspan: n, class: "empty" }, msg));
+const headOf = (t, p) => parts.find(x => x.topic === t && x.partition === p)?.head ?? 0;
+
+async function get(path, as = "json") {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return as === "json" ? r.json() : r.arrayBuffer();
+}
+
+async function refresh() {
+  const [p, g] = await Promise.all([get("/t"), get("/g")]);
+  parts = p;
+  $("partitions").replaceChildren(...(p.length ? p.map(x => {
+    const tr = el("tr", { class: "link" }, td(x.topic), td(x.partition, "num"), td(x.head, "num"));
+    if (view && view.topic === x.topic && view.partition === x.partition) tr.classList.add("sel");
+    tr.onclick = () => open(x.topic, x.partition, Math.max(0, x.head - PAGE));
+    return tr;
+  }) : [empty(3, "No messages yet.")]));
+  $("groups").replaceChildren(...(g.length ? g.map(x => {
+    const lag = Math.max(0, headOf(x.topic, x.partition) - x.committed);
+    return el("tr", {}, td(x.group), td(x.topic), td(x.partition, "num"), td(x.committed, "num"),
+      td(lag, "num" + (lag ? " lag" : "")), td(x.holder ?? "—", x.holder ? "" : "muted"));
+  }) : [empty(6, "No committed offsets yet.")]));
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  if (view) await load();
+}
+
+// Text if it decodes as UTF-8, hex otherwise.
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+function render(bytes) {
+  try { return [null, utf8.decode(bytes)]; }
+  catch { return ["hex", [...bytes].map(b => b.toString(16).padStart(2, "0")).join(" ")]; }
+}
+
+function parse(buf) {
+  const dv = new DataView(buf), out = [];
+  for (let i = 0; i + 12 <= buf.byteLength;) {
+    const offset = dv.getBigUint64(i), len = dv.getUint32(i + 8);
+    out.push({ offset, bytes: new Uint8Array(buf, i + 12, len) });
+    i += 12 + len;
+  }
+  return out;
+}
+
+async function load() {
+  const { topic, partition, from } = view;
+  const head = headOf(topic, partition);
+  $("vtitle").textContent = `${topic} / ${partition}`;
+  $("from").value = from;
+  $("verr").hidden = true;
+  let msgs = [];
+  try {
+    const path = `/t/${encodeURIComponent(topic)}/${partition}/${from}`;
+    msgs = parse(await get(path, "bin")).slice(0, PAGE);
+  } catch (e) {
+    $("verr").textContent = e.message;
+    $("verr").hidden = false;
+  }
+  $("messages").replaceChildren(...(msgs.length ? msgs.map(m => {
+    const [kind, text] = render(m.bytes);
+    const val = el("td", { class: "val" });
+    if (kind) val.append(el("span", { class: "chip" }, kind));
+    val.append(text);
+    return el("tr", {}, td(m.offset, "num"), td(m.bytes.length, "num"), val);
+  }) : [empty(3, from >= head ? "Nothing at or after this offset yet." : "No messages.")]));
+  const last = msgs.length ? Number(msgs[msgs.length - 1].offset) : from - 1;
+  $("range").textContent = msgs.length ? `${from}–${last} of ${head}` : `head ${head}`;
+  $("older").disabled = from <= 0;
+  $("newer").disabled = last + 1 >= head;
+  $("viewer").hidden = false;
+}
+
+function open(topic, partition, from) {
+  view = { topic, partition, from: Math.max(0, from) };
+  history.replaceState(null, "", `#${new URLSearchParams({ t: topic, p: partition, from: view.from })}`);
+  refresh().catch(showErr);
+}
+
+function showErr(e) {
+  $("updated").textContent = "error: " + e.message;
+}
+
+$("refresh").onclick = () => refresh().catch(showErr);
+$("older").onclick = () => open(view.topic, view.partition, view.from - PAGE);
+$("newer").onclick = () => open(view.topic, view.partition, view.from + PAGE);
+$("latest").onclick = () => open(view.topic, view.partition, headOf(view.topic, view.partition) - PAGE);
+$("from").onchange = e => open(view.topic, view.partition, Number(e.target.value) || 0);
+
+const h = new URLSearchParams(location.hash.slice(1));
+if (h.has("t")) open(h.get("t"), Number(h.get("p")) || 0, Number(h.get("from")) || 0);
+else refresh().catch(showErr);
+</script>
+</body>
+</html>
