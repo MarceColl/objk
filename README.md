@@ -40,6 +40,9 @@ Only one objk may run per store + path: slateDB fences the older writer.
 ## API
 
 ```
+GET    /                                              -> read-only web UI
+GET    /t                                             -> [{topic, partition, head}]
+GET    /g                                             -> [{group, topic, partition, committed, holder}]
 POST   /t/{topic}/{p}                body: message(s) -> first offset
 GET    /t/{topic}/{p}                                 -> head (next offset to be written)
 GET    /t/{topic}/{p}/{from}                          -> up to 1000 messages from `from`
