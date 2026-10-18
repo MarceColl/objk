@@ -94,3 +94,21 @@ A dead consumer's partitions are picked up by others after at most 30s. Processi
 a batch in flight when a claim is lost may be processed again.
 
 Logs go to stdout; filter with `RUST_LOG` (default `info`). SIGTERM/SIGINT drain in-flight requests and close the DB.
+
+## Testing
+
+`cargo test` runs unit tests plus a deterministic simulation ([src/sim.rs](src/sim.rs), turmoil):
+the real server over a simulated network with producers and consumers, while the server is
+crashed, links are cut or delayed, consumers vanish or stall past their claim, and object
+storage is slow. Afterwards the surviving store is checked against what clients observed:
+contiguous offsets, no lost acks or reused offsets, consumers only see what was written,
+at-least-once processing, durable and monotonic commits, exclusive claims.
+
+Every run replays exactly from its seed (each prints a fingerprint):
+
+```sh
+OBJK_SIM_SEED=7 cargo test simulation -- --nocapture   # rerun one seed
+OBJK_SIM_RUNS=50 cargo test --release simulation        # more seeds (from OBJK_SIM_FIRST, default 0)
+```
+
+A nightly CI job runs 100 fresh seeds in release mode.

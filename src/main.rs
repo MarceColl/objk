@@ -12,6 +12,7 @@ use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, Error, IterationOrder, WriteBatch};
+use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 use std::future::ready;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -65,9 +66,9 @@ fn split_partition(k: &[u8]) -> (&str, u32, &[u8]) {
 
 /// slateDB's defaults assume a machine of its own: up to 1 GiB of unflushed writes, a 640 MiB
 /// cache and four concurrent compactions, which OOM-killed a 512 MiB pod under batch load.
-/// These keep objk around 0.65 GiB peak under burst writes (1.1 GiB with the defaults); when
-/// unflushed writes hit the cap, producers wait.
-async fn open(path: &str, store: Arc<dyn ObjectStore>) -> Result<Db, Error> {
+/// These (with the cache in `Store::open`) keep objk around 0.65 GiB peak under burst writes
+/// (1.1 GiB with the defaults); when unflushed writes hit the cap, producers wait.
+fn bounded() -> Settings {
     let mut settings = Settings { max_unflushed_bytes: 128 << 20, ..Default::default() };
     if let Some(c) = settings.compactor_options.as_mut() {
         c.max_concurrent_compactions = 1;
@@ -75,17 +76,11 @@ async fn open(path: &str, store: Arc<dyn ObjectStore>) -> Result<Db, Error> {
             w.max_concurrent_compactions = 1;
         }
     }
-    let cache = |mib: u64| Some(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: mib << 20, ..Default::default() })) as Arc<dyn DbCache>);
-    let cache = SplitCache::new().with_block_cache(cache(128)).with_meta_cache(cache(32)).build();
-    Db::builder(path, store).with_settings(settings).with_db_cache(Arc::new(cache), 0).build().await
+    settings
 }
 
 /// How long a claim lives without being renewed.
 const CLAIM_TTL_MS: u64 = 30_000;
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
-}
 
 // Metrics. Lag isn't exported: Grafana derives it as
 //   objk_head_offset - on(topic, partition) group_right objk_committed_offset
@@ -128,11 +123,29 @@ struct Store {
     db: Db,
     /// Serializes read-modify-writes so offsets are assigned and written in order.
     write: Mutex<()>,
+    /// The same clock slateDB runs on; the simulation swaps in virtual time.
+    clock: Arc<dyn SystemClock>,
 }
 
 impl Store {
-    fn new(db: Db) -> Self {
-        Store { db, write: Mutex::new(()) }
+    /// `seed` makes slateDB's randomness (object ids, ...) deterministic; only the simulation sets it,
+    /// and must vary it per open.
+    async fn open(
+        path: &str,
+        os: Arc<dyn ObjectStore>,
+        clock: Arc<dyn SystemClock>,
+        seed: Option<u64>,
+        settings: Settings,
+    ) -> Result<Self, Error> {
+        let cache = |mib: u64| Some(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: mib << 20, ..Default::default() })) as Arc<dyn DbCache>);
+        let cache = SplitCache::new().with_block_cache(cache(128)).with_meta_cache(cache(32)).build();
+        let b = Db::builder(path, os).with_system_clock(clock.clone()).with_settings(settings).with_db_cache(Arc::new(cache), 0);
+        let db = match seed { Some(seed) => b.with_seed(seed), None => b }.build().await?;
+        Ok(Store { db, write: Mutex::new(()), clock })
+    }
+
+    fn now(&self) -> u64 {
+        self.clock.now().timestamp_millis() as u64
     }
 
     /// Appends `msgs` atomically at contiguous offsets and returns the first one.
@@ -346,15 +359,15 @@ async fn head(State(s): S, Path((t, p)): Path<(String, u32)>) -> Result<String, 
 const MEMBER: &str = "x-objk-member";
 
 async fn commit(State(s): S, Path((g, t, p, off)): Path<(String, String, u32, u64)>, h: HeaderMap) -> Result<(), QErr> {
-    s.commit(&g, &t, p, header(&h, MEMBER), off, now_ms()).await
+    s.commit(&g, &t, p, header(&h, MEMBER), off, s.now()).await
 }
 
 async fn claim(State(s): S, Path((g, t, p)): Path<(String, String, u32)>, h: HeaderMap) -> Result<(), QErr> {
-    s.claim(&g, &t, p, header(&h, MEMBER), now_ms()).await
+    s.claim(&g, &t, p, header(&h, MEMBER), s.now()).await
 }
 
 async fn release(State(s): S, Path((g, t, p)): Path<(String, String, u32)>, h: HeaderMap) -> Result<(), QErr> {
-    s.release(&g, &t, p, header(&h, MEMBER), now_ms()).await
+    s.release(&g, &t, p, header(&h, MEMBER), s.now()).await
 }
 
 async fn committed(State(s): S, Path((g, t, p)): Path<(String, String, u32)>) -> Result<String, QErr> {
@@ -366,7 +379,7 @@ async fn partitions(State(s): S) -> Result<Json<Vec<Partition>>, QErr> {
 }
 
 async fn groups(State(s): S) -> Result<Json<Vec<Group>>, QErr> {
-    Ok(Json(s.groups(now_ms()).await?))
+    Ok(Json(s.groups(s.now()).await?))
 }
 
 fn router(s: Arc<Store>) -> Router {
@@ -394,8 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::stdout().is_terminal()).init();
     let env = |k, d: &str| std::env::var(k).unwrap_or(d.into());
     let (url, path) = (env("OBJK_STORE", "file:///"), env("OBJK_PATH", "data"));
-    let db = open(&path, Db::resolve_object_store(&url)?).await?;
-    let store = Arc::new(Store::new(db));
+    let clock = Arc::new(DefaultSystemClock::new());
+    let store = Arc::new(Store::open(&path, Db::resolve_object_store(&url)?, clock, None, bounded()).await?);
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let app = router(store.clone()).route("/metrics", get(move || ready(metrics.render())));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
@@ -418,12 +431,15 @@ async fn shutdown() {
 }
 
 #[cfg(test)]
+mod sim;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use slatedb::object_store::memory::InMemory;
 
     async fn store() -> Store {
-        Store::new(open("t", Arc::new(InMemory::new())).await.unwrap())
+        Store::open("t", Arc::new(InMemory::new()), Arc::new(DefaultSystemClock::new()), None, bounded()).await.unwrap()
     }
 
     fn msgs(ms: &[&'static str]) -> Vec<Bytes> {

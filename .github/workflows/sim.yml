@@ -1,0 +1,19 @@
+name: sim
+
+# 100 fresh seeds a night: fixed seeds would re-test the same runs.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release simulation -- --nocapture
+        env:
+          OBJK_SIM_FIRST: ${{ github.run_number }}00
+          OBJK_SIM_RUNS: "100"

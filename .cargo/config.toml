@@ -1,0 +1,3 @@
+# Lets turmoil seed tokio's RNG (select! order etc.) so simulations replay exactly.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
