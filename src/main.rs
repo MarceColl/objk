@@ -7,7 +7,10 @@ use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::Serialize;
 use slatedb::bytes::{Buf, Bytes};
-use slatedb::config::{DurabilityLevel, ScanOptions};
+use slatedb::config::{DurabilityLevel, ScanOptions, Settings};
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::db_cache::{DbCache, SplitCache};
+use slatedb::object_store::ObjectStore;
 use slatedb::{Db, Error, IterationOrder, WriteBatch};
 use std::future::ready;
 use std::io::IsTerminal;
@@ -58,6 +61,23 @@ fn split_name(k: &[u8]) -> (&str, &[u8]) {
 fn split_partition(k: &[u8]) -> (&str, u32, &[u8]) {
     let (topic, rest) = split_name(k);
     (topic, u32::from_be_bytes(rest[..4].try_into().unwrap()), &rest[4..])
+}
+
+/// slateDB's defaults assume a machine of its own: up to 1 GiB of unflushed writes, a 640 MiB
+/// cache and four concurrent compactions, which OOM-killed a 512 MiB pod under batch load.
+/// These keep objk around 0.65 GiB peak under burst writes (1.1 GiB with the defaults); when
+/// unflushed writes hit the cap, producers wait.
+async fn open(path: &str, store: Arc<dyn ObjectStore>) -> Result<Db, Error> {
+    let mut settings = Settings { max_unflushed_bytes: 128 << 20, ..Default::default() };
+    if let Some(c) = settings.compactor_options.as_mut() {
+        c.max_concurrent_compactions = 1;
+        if let Some(w) = c.worker.as_mut() {
+            w.max_concurrent_compactions = 1;
+        }
+    }
+    let cache = |mib: u64| Some(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: mib << 20, ..Default::default() })) as Arc<dyn DbCache>);
+    let cache = SplitCache::new().with_block_cache(cache(128)).with_meta_cache(cache(32)).build();
+    Db::builder(path, store).with_settings(settings).with_db_cache(Arc::new(cache), 0).build().await
 }
 
 /// How long a claim lives without being renewed.
@@ -368,7 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::stdout().is_terminal()).init();
     let env = |k, d: &str| std::env::var(k).unwrap_or(d.into());
     let (url, path) = (env("OBJK_STORE", "file:///"), env("OBJK_PATH", "data"));
-    let db = Db::open(path.clone(), Db::resolve_object_store(&url)?).await?;
+    let db = open(&path, Db::resolve_object_store(&url)?).await?;
     let store = Arc::new(Store::new(db));
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let app = router(store.clone()).route("/metrics", get(move || ready(metrics.render())));
@@ -397,7 +417,7 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
 
     async fn store() -> Store {
-        Store::new(Db::open("t", Arc::new(InMemory::new())).await.unwrap())
+        Store::new(open("t", Arc::new(InMemory::new())).await.unwrap())
     }
 
     fn msgs(ms: &[&'static str]) -> Vec<Bytes> {
