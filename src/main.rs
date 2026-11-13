@@ -400,7 +400,12 @@ fn router(s: Arc<Store>) -> Router {
 ///   OBJK_STORE  object store root URL, no path (default `file:///`), e.g. `s3://bucket`
 ///   OBJK_PATH   DB location inside the store (default `data`)
 ///   AWS_*       store options, passed through by slateDB (AWS_ENDPOINT, AWS_ALLOW_HTTP, ...)
+///   OBJK_OPEN_TIMEOUT  seconds the store may take to open before objk exits (default 10)
 ///   RUST_LOG    log filter (default `info`)
+///
+/// slateDB's open can stall for good on a request the store went away under (kinoko found it:
+/// s3 restarted while objk was opening, and objk never listened). Past the timeout objk exits,
+/// for its supervisor to start it again on fresh connections.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
@@ -408,7 +413,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env = |k, d: &str| std::env::var(k).unwrap_or(d.into());
     let (url, path) = (env("OBJK_STORE", "file:///"), env("OBJK_PATH", "data"));
     let clock = Arc::new(DefaultSystemClock::new());
-    let store = Arc::new(Store::open(&path, Db::resolve_object_store(&url)?, clock, None, bounded()).await?);
+    let within = std::time::Duration::from_secs(env("OBJK_OPEN_TIMEOUT", "10").parse()?);
+    let open = Store::open(&path, Db::resolve_object_store(&url)?, clock, None, bounded());
+    let store = Arc::new(tokio::time::timeout(within, open).await.map_err(|_| format!("the store did not open within {within:?}"))??);
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let app = router(store.clone()).route("/metrics", get(move || ready(metrics.render())));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
