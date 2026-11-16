@@ -7,13 +7,13 @@ use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::Serialize;
 use slatedb::bytes::{Buf, Bytes};
-use slatedb::config::{DurabilityLevel, ScanOptions, Settings};
+use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions, Settings};
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, Error, IterationOrder, WriteBatch};
+use slatedb::{CloseReason, Db, Error, IterationOrder, WriteBatch};
 use slatedb_common::clock::{DefaultSystemClock, SystemClock};
-use std::future::ready;
+use std::future::{ready, IntoFuture};
 use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 //   m/{topic}/{p}{off}        -> payload
 //   g/{group}/{topic}/{p}     -> u64 committed
 //   c/{group}/{topic}/{p}     -> u64 claim expiry (unix ms) | member
+//   w                         -> u64 unix ms, written by every read (`barrier`)
 
 /// Names are embedded in keys, so '/' would make `foo` a prefix of `foo/bar`.
 fn name(s: &str) -> Result<(), QErr> {
@@ -78,6 +79,13 @@ fn bounded() -> Settings {
     }
     settings
 }
+
+// Two views of the store. A decision taken under `write` (the next offset, the committed
+// offset a commit can't go below, a claim's holder) sees writes still on their way to the
+// store: it has to, to take them in the order they were made. What a client is served is only
+// what is in the store, and only once this objk has shown it is still the writer (`barrier`).
+const MINE: DurabilityLevel = DurabilityLevel::Memory;
+const STORED: DurabilityLevel = DurabilityLevel::Remote;
 
 /// How long a claim lives without being renewed.
 const CLAIM_TTL_MS: u64 = 30_000;
@@ -156,7 +164,7 @@ impl Store {
         let l = labels(topic, p);
         let (first, handle) = {
             let _g = self.write.lock().await;
-            let first = self.head(topic, p).await?;
+            let first = self.end(topic, p, MINE).await?;
             let mut batch = WriteBatch::new();
             for (off, m) in (first..).zip(msgs) {
                 batch.put(msg_key(topic, p, off), m);
@@ -171,11 +179,21 @@ impl Store {
         Ok(first)
     }
 
-    /// Only durable messages: anything else could vanish on crash and its offset be reused.
+    /// Proves this objk is still the writer before it serves a read: a write made after the
+    /// read began, waited on until it is in the store. Once a newer objk has opened the store
+    /// the write fails (slateDB fences the older writer), so a replaced objk, which may not know
+    /// it yet or may not reach the store to learn it, never serves what only it still holds.
+    /// Reads at the same moment wait on the same flush.
+    async fn barrier(&self) -> Result<(), QErr> {
+        Ok(self.db.put(b"w", self.now().to_be_bytes()).await?.await_durable().await?)
+    }
+
+    /// Only messages in the store: anything else could vanish on crash and its offset be reused.
     async fn fetch(&self, topic: &str, p: u32, from: u64, max: usize) -> Result<Vec<(u64, Bytes)>, QErr> {
         name(topic)?;
+        self.barrier().await?;
         let opts = ScanOptions {
-            durability_filter: DurabilityLevel::Remote,
+            durability_filter: STORED,
             read_ahead_bytes: 256 * 1024,
             cache_blocks: true,
             max_fetch_tasks: 4,
@@ -192,12 +210,14 @@ impl Store {
     }
 
     /// `off` is the next offset to read. Only the claim holder may commit, and it's monotonic,
-    /// so a stale consumer can't move it back.
+    /// so a stale consumer can't move it back. It can't pass the end of the log in the store:
+    /// the messages it would skip don't exist yet, and once written would never be read.
     async fn commit(&self, group: &str, topic: &str, p: u32, member: &str, off: u64, now: u64) -> Result<(), QErr> {
         let handle = {
             let _g = self.write.lock().await;
-            ensure(self.holder(group, topic, p, now).await?.as_deref() == Some(member), QErr::Taken)?;
-            let off = off.max(self.committed(group, topic, p).await?);
+            ensure(self.holder(group, topic, p, now, MINE).await?.as_deref() == Some(member), QErr::Taken)?;
+            ensure(off <= self.end(topic, p, STORED).await?, QErr::Bad("past the end of the log"))?;
+            let off = off.max(self.committed_at(group, topic, p, MINE).await?);
             let l = [("group", group.to_string()), ("topic", topic.to_string()), ("partition", p.to_string())];
             gauge!("objk_committed_offset", &l).set(off as f64);
             self.db.put(group_key(b"g/", group, topic, p), off.to_be_bytes()).await?
@@ -205,10 +225,16 @@ impl Store {
         Ok(handle.await_durable().await?)
     }
 
+    /// Only commits in the store: anything else could vanish on crash and the offset go back.
     async fn committed(&self, group: &str, topic: &str, p: u32) -> Result<u64, QErr> {
+        self.barrier().await?;
+        self.committed_at(group, topic, p, STORED).await
+    }
+
+    async fn committed_at(&self, group: &str, topic: &str, p: u32, at: DurabilityLevel) -> Result<u64, QErr> {
         name(group)?;
         name(topic)?;
-        let v = self.db.get(group_key(b"g/", group, topic, p)).await?;
+        let v = self.get(group_key(b"g/", group, topic, p), at).await?;
         Ok(v.map_or(0, |v| u64::from_be_bytes(v[..].try_into().unwrap())))
     }
 
@@ -218,7 +244,7 @@ impl Store {
         ensure(!member.is_empty(), QErr::Bad("missing member"))?;
         let handle = {
             let _g = self.write.lock().await;
-            ensure(self.holder(group, topic, p, now).await?.is_none_or(|h| h == member), QErr::Taken)?;
+            ensure(self.holder(group, topic, p, now, MINE).await?.is_none_or(|h| h == member), QErr::Taken)?;
             let v = [&(now + CLAIM_TTL_MS).to_be_bytes()[..], member.as_bytes()].concat();
             self.db.put(group_key(b"c/", group, topic, p), v).await?
         };
@@ -228,17 +254,17 @@ impl Store {
     /// Drops the claim if we hold it; otherwise a no-op.
     async fn release(&self, group: &str, topic: &str, p: u32, member: &str, now: u64) -> Result<(), QErr> {
         let _g = self.write.lock().await;
-        if self.holder(group, topic, p, now).await?.as_deref() == Some(member) {
+        if self.holder(group, topic, p, now, MINE).await?.as_deref() == Some(member) {
             self.db.delete(group_key(b"c/", group, topic, p)).await?.await_durable().await?;
         }
         Ok(())
     }
 
     /// Member holding an unexpired claim, if any.
-    async fn holder(&self, group: &str, topic: &str, p: u32, now: u64) -> Result<Option<String>, QErr> {
+    async fn holder(&self, group: &str, topic: &str, p: u32, now: u64, at: DurabilityLevel) -> Result<Option<String>, QErr> {
         name(group)?;
         name(topic)?;
-        let v = self.db.get(group_key(b"c/", group, topic, p)).await?;
+        let v = self.get(group_key(b"c/", group, topic, p), at).await?;
         let live = v.filter(|v| u64::from_be_bytes(v[..8].try_into().unwrap()) > now);
         Ok(live.map(|v| String::from_utf8_lossy(&v[8..]).into_owned()))
     }
@@ -246,12 +272,14 @@ impl Store {
     /// Every partition with its head, by skip-scan over the message keys: one seek per
     /// partition, nothing extra to keep in sync. `m0` bounds the scan: '0' sorts right after '/'.
     async fn partitions(&self) -> Result<Vec<Partition>, QErr> {
+        self.barrier().await?;
+        let opts = ScanOptions { durability_filter: STORED, ..Default::default() };
         let mut out = Vec::new();
         let mut from = b"m/".to_vec();
         loop {
-            let Some(kv) = self.db.scan(from..b"m0".to_vec()).await?.next().await? else { break };
+            let Some(kv) = self.db.scan_with_options(from..b"m0".to_vec(), &opts).await?.next().await? else { break };
             let (topic, p, _) = split_partition(&kv.key[2..]);
-            out.push(Partition { topic: topic.into(), partition: p, head: self.head(topic, p).await? });
+            out.push(Partition { topic: topic.into(), partition: p, head: self.end(topic, p, STORED).await? });
             from = match p.checked_add(1) {
                 Some(next) => partition_key(b"m/", topic, next),
                 None => [b"m/", topic.as_bytes(), b"0"].concat(),
@@ -263,22 +291,35 @@ impl Store {
     /// Every committed group offset, with the live claim holder. Groups that only ever
     /// claimed have nothing committed and aren't listed.
     async fn groups(&self, now: u64) -> Result<Vec<Group>, QErr> {
-        let mut it = self.db.scan(b"g/".to_vec()..b"g0".to_vec()).await?;
+        self.barrier().await?;
+        let opts = ScanOptions { durability_filter: STORED, ..Default::default() };
+        let mut it = self.db.scan_with_options(b"g/".to_vec()..b"g0".to_vec(), &opts).await?;
         let mut out = Vec::new();
         while let Some(kv) = it.next().await? {
             let (group, rest) = split_name(&kv.key[2..]);
             let (topic, p, _) = split_partition(rest);
             let committed = u64::from_be_bytes(kv.value[..].try_into().unwrap());
-            let holder = self.holder(group, topic, p, now).await?;
+            let holder = self.holder(group, topic, p, now, STORED).await?;
             out.push(Group { group: group.into(), topic: topic.into(), partition: p, committed, holder });
         }
         Ok(out)
     }
 
-    /// Next offset to be written. Derived from the last message key, so no counter to keep in sync.
+    async fn get(&self, key: Vec<u8>, at: DurabilityLevel) -> Result<Option<Bytes>, QErr> {
+        Ok(self.db.get_with_options(key, &ReadOptions { durability_filter: at, ..Default::default() }).await?)
+    }
+
+    /// The end of the log in the store: the offset after the last message a reader can be served.
     async fn head(&self, topic: &str, p: u32) -> Result<u64, QErr> {
+        self.barrier().await?;
+        self.end(topic, p, STORED).await
+    }
+
+    /// The offset after the last message, as seen `at`. Derived from the last message key, so no
+    /// counter to keep in sync.
+    async fn end(&self, topic: &str, p: u32, at: DurabilityLevel) -> Result<u64, QErr> {
         name(topic)?;
-        let opts = ScanOptions { order: IterationOrder::Descending, ..Default::default() };
+        let opts = ScanOptions { order: IterationOrder::Descending, durability_filter: at, ..Default::default() };
         let mut it = self.db.scan_with_options(msg_key(topic, p, 0)..=msg_key(topic, p, u64::MAX), &opts).await?;
         Ok(it.next().await?.map_or(0, |kv| msg_off(&kv.key) + 1))
     }
@@ -420,7 +461,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(store.clone()).route("/metrics", get(move || ready(metrics.render())));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     info!(store = url, path, addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
+    // The store closes under objk for good when a newer objk opens it (fenced) or slateDB fails:
+    // every request would fail from then on, so objk exits. Being replaced is not a failure (0),
+    // so a supervisor that restarts on failure leaves it down; starting it again would take the
+    // store back from the newer one.
+    let mut status = store.db.subscribe();
+    let closed = async move { status.wait_for(|s| s.close_reason.is_some()).await.ok().and_then(|s| s.close_reason) };
+    tokio::select! {
+        served = axum::serve(listener, app).with_graceful_shutdown(shutdown()).into_future() => served?,
+        why = closed => {
+            if why == Some(CloseReason::Fenced) {
+                info!("a newer objk opened the store: exiting");
+                return Ok(());
+            }
+            return Err(format!("the store closed under objk: {why:?}").into());
+        }
+    }
     info!("draining done, closing db");
     store.db.close().await?;
     info!("closed");
@@ -513,6 +569,7 @@ mod tests {
     #[tokio::test]
     async fn commit_monotonic() {
         let s = store().await;
+        s.produce("a", 0, &msgs(&["x"; 5])).await.unwrap();
         s.claim("g", "a", 0, "m", 0).await.unwrap();
         assert_eq!(s.committed("g", "a", 0).await.unwrap(), 0);
         s.commit("g", "a", 0, "m", 5, 0).await.unwrap();
@@ -520,6 +577,58 @@ mod tests {
         assert_eq!(s.committed("g", "a", 0).await.unwrap(), 5);
         assert_eq!(s.committed("h", "a", 0).await.unwrap(), 0);
         assert!(matches!(s.commit("g/x", "a", 0, "m", 1, 0).await, Err(QErr::Bad(_))));
+    }
+
+    #[tokio::test]
+    async fn a_commit_cannot_pass_the_end_of_the_log() {
+        let s = store().await;
+        s.produce("a", 0, &msgs(&["x", "y"])).await.unwrap();
+        s.claim("g", "a", 0, "m", 0).await.unwrap();
+        assert!(matches!(s.commit("g", "a", 0, "m", 3, 0).await, Err(QErr::Bad(_))));
+        s.commit("g", "a", 0, "m", 2, 0).await.unwrap();
+        assert_eq!(s.committed("g", "a", 0).await.unwrap(), 2);
+    }
+
+    /// A newer objk opening the store fences the older, which still holds the log as it was in
+    /// memory: it must serve none of it, and its store says why it closed.
+    #[tokio::test]
+    async fn a_replaced_objk_serves_no_read() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let open = || Store::open("t", os.clone(), Arc::new(DefaultSystemClock::new()), None, bounded());
+        let old = open().await.unwrap();
+        old.produce("a", 0, &msgs(&["x"])).await.unwrap();
+        old.claim("g", "a", 0, "m", 0).await.unwrap();
+        old.commit("g", "a", 0, "m", 1, 0).await.unwrap();
+        let new = open().await.unwrap();
+        new.produce("a", 0, &msgs(&["y"])).await.unwrap();
+        assert_eq!(new.fetch("a", 0, 0, 10).await.unwrap(), vec![(0, Bytes::from("x")), (1, Bytes::from("y"))]);
+
+        assert!(old.fetch("a", 0, 0, 10).await.is_err());
+        assert!(old.head("a", 0).await.is_err());
+        assert!(old.committed("g", "a", 0).await.is_err());
+        assert!(old.partitions().await.is_err());
+        assert!(old.groups(0).await.is_err());
+        assert_eq!(old.db.status().close_reason, Some(CloseReason::Fenced));
+    }
+
+    /// What a client is served is what is in the store; what a decision sees includes writes on
+    /// their way there. No WAL flush happens but by hand here, so writes stay on their way.
+    #[tokio::test]
+    async fn clients_are_served_only_what_is_in_the_store() {
+        let settings = Settings { flush_interval: None, ..bounded() };
+        let s = Store::open("t", Arc::new(InMemory::new()), Arc::new(DefaultSystemClock::new()), None, settings).await.unwrap();
+        s.db.put(msg_key("a", 0, 0), b"x").await.unwrap();
+        s.db.put(group_key(b"c/", "g", "a", 0), [&u64::MAX.to_be_bytes()[..], b"m"].concat()).await.unwrap();
+        s.db.put(group_key(b"g/", "g", "a", 0), 1u64.to_be_bytes()).await.unwrap();
+        s.db.flush().await.unwrap();
+        s.db.put(msg_key("a", 0, 1), b"y").await.unwrap();
+        s.db.put(group_key(b"c/", "g", "a", 0), [&u64::MAX.to_be_bytes()[..], b"n"].concat()).await.unwrap();
+        s.db.put(group_key(b"g/", "g", "a", 0), 2u64.to_be_bytes()).await.unwrap();
+        // A head that counted "y" would go back if objk crashed now, and its offset be reused.
+        assert_eq!((s.end("a", 0, STORED).await.unwrap(), s.end("a", 0, MINE).await.unwrap()), (1, 2));
+        assert_eq!((s.committed_at("g", "a", 0, STORED).await.unwrap(), s.committed_at("g", "a", 0, MINE).await.unwrap()), (1, 2));
+        let holder = |at| s.holder("g", "a", 0, 0, at);
+        assert_eq!((holder(STORED).await.unwrap(), holder(MINE).await.unwrap()), (Some("m".into()), Some("n".into())));
     }
 
     #[tokio::test]
