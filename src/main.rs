@@ -437,10 +437,21 @@ fn router(s: Arc<Store>) -> Router {
         .with_state(s)
 }
 
+/// The store at `url`, with the `AWS_*` and client options in the env. A pooled connection to an
+/// address that is gone (s3 restarted elsewhere) gets no RST: without a stall limit every request
+/// on it waits out the whole 30 s request timeout before it is retried (kinoko found it).
+fn object_store(url: &str) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
+    let limits = [("read_timeout", "5s"), ("pool_idle_timeout", "10s")].map(|(k, v)| (k.into(), v.into()));
+    let env = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+    let (os, _) = slatedb::object_store::parse_url_opts(&url.try_into()?, limits.into_iter().chain(env))?;
+    Ok(Arc::from(os))
+}
+
 /// Served on :3000. Config is env only:
 ///   OBJK_STORE  object store root URL, no path (default `file:///`), e.g. `s3://bucket`
 ///   OBJK_PATH   DB location inside the store (default `data`)
 ///   AWS_*       store options, passed through by slateDB (AWS_ENDPOINT, AWS_ALLOW_HTTP, ...)
+///   READ_TIMEOUT, POOL_IDLE_TIMEOUT  store client stall and idle limits (default 5s, 10s)
 ///   OBJK_OPEN_TIMEOUT  seconds the store may take to open before objk exits (default 10)
 ///   RUST_LOG    log filter (default `info`)
 ///
@@ -455,7 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (url, path) = (env("OBJK_STORE", "file:///"), env("OBJK_PATH", "data"));
     let clock = Arc::new(DefaultSystemClock::new());
     let within = std::time::Duration::from_secs(env("OBJK_OPEN_TIMEOUT", "10").parse()?);
-    let open = Store::open(&path, Db::resolve_object_store(&url)?, clock, None, bounded());
+    let open = Store::open(&path, object_store(&url)?, clock, None, bounded());
     let store = Arc::new(tokio::time::timeout(within, open).await.map_err(|_| format!("the store did not open within {within:?}"))??);
     let metrics = PrometheusBuilder::new().install_recorder()?;
     let app = router(store.clone()).route("/metrics", get(move || ready(metrics.render())));
